@@ -1,7 +1,7 @@
 "use client";
 
 import React, { createContext, useContext, useEffect, useCallback, useRef, useState } from "react";
-import { doc, setDoc, onSnapshot } from "firebase/firestore";
+import { doc, setDoc, getDoc } from "firebase/firestore";
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/context/AuthContext";
 import {
@@ -29,32 +29,47 @@ const initialState: AppState = {
 // CONTEXT TYPES
 // ============================================
 interface TimerContextType {
-  // State
   workElapsedSeconds: number;
   playBalanceSeconds: number;
   mode: Mode;
   quests: Quest[];
   inventory: InventoryItem[];
   isHydrated: boolean;
-
-  // Timer Actions
   setMode: (mode: Mode) => void;
   applyPenalty: () => void;
-
-  // Quest Actions
   addQuest: (title: string, rewardMinutes: number) => void;
   deleteQuest: (id: string) => void;
   claimQuest: (quest: Quest) => void;
-
-  // Inventory Actions
   useInventoryItems: (ids: string[]) => void;
-
-  // Notification state
   showPlayEndedNotification: boolean;
   dismissPlayEndedNotification: () => void;
 }
 
 const TimerContext = createContext<TimerContextType | null>(null);
+
+// ============================================
+// DEBOUNCE HELPER
+// ============================================
+function useDebouncedCallback<T extends (...args: Parameters<T>) => void>(
+  callback: T,
+  delay: number
+): T {
+  const timeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const callbackRef = useRef(callback);
+  callbackRef.current = callback;
+
+  return useCallback(
+    ((...args: Parameters<T>) => {
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+      }
+      timeoutRef.current = setTimeout(() => {
+        callbackRef.current(...args);
+      }, delay);
+    }) as T,
+    [delay]
+  );
+}
 
 // ============================================
 // PROVIDER COMPONENT
@@ -65,57 +80,186 @@ export function TimerProvider({ children }: { children: React.ReactNode }) {
   const [isHydrated, setIsHydrated] = useState(false);
   const [showPlayEndedNotification, setShowPlayEndedNotification] = useState(false);
 
-  // Ref to track if we've requested notification permission
   const notificationPermissionRequested = useRef(false);
-  // Ref to prevent saving during initial load
-  const isInitialLoad = useRef(true);
+  const isLoadingFromFirestore = useRef(false);
+  const lastSavedState = useRef<string>("");
 
   // ============================================
-  // FIRESTORE SYNC - Load user data
+  // FIRESTORE SAVE (debounced - 2 seconds)
+  // ============================================
+  const saveToFirestore = useDebouncedCallback(
+    async (userId: string, data: AppState) => {
+      if (isLoadingFromFirestore.current) return;
+
+      const stateString = JSON.stringify(data);
+      // Don't save if nothing changed
+      if (stateString === lastSavedState.current) return;
+
+      try {
+        const userDocRef = doc(db, "users", userId);
+        await setDoc(userDocRef, data);
+        lastSavedState.current = stateString;
+        console.log("[Firestore] Saved at", new Date().toLocaleTimeString());
+      } catch (error) {
+        console.error("[Firestore] Save error:", error);
+      }
+    },
+    2000 // Save every 2 seconds max
+  );
+
+  // ============================================
+  // FIRESTORE LOAD - Only on mount/user change
   // ============================================
   useEffect(() => {
     if (!user) {
       setState(initialState);
       setIsHydrated(false);
-      isInitialLoad.current = true;
+      lastSavedState.current = "";
       return;
     }
 
-    // Subscribe to user's data in Firestore
-    const userDocRef = doc(db, "users", user.uid);
-    const unsubscribe = onSnapshot(userDocRef, (docSnap) => {
-      if (docSnap.exists()) {
-        const data = docSnap.data() as AppState;
-        setState({
-          ...initialState,
-          ...data,
-          lastTickTimestamp: data.lastTickTimestamp || Date.now(),
-        });
-      } else {
-        // New user - create initial document
-        setDoc(userDocRef, {
-          ...initialState,
-          lastTickTimestamp: Date.now(),
-        });
-      }
-      setIsHydrated(true);
-      // Allow saving after initial load completes
-      setTimeout(() => {
-        isInitialLoad.current = false;
-      }, 500);
-    });
+    const loadFromFirestore = async () => {
+      isLoadingFromFirestore.current = true;
 
-    return () => unsubscribe();
+      try {
+        const userDocRef = doc(db, "users", user.uid);
+        const docSnap = await getDoc(userDocRef);
+
+        if (docSnap.exists()) {
+          const data = docSnap.data() as AppState;
+          const now = Date.now();
+          const lastTimestamp = data.lastTickTimestamp || now;
+          const elapsedSeconds = Math.floor((now - lastTimestamp) / 1000);
+
+          // Calculate time that passed while offline
+          let workElapsed = data.workElapsedSeconds || 0;
+          let playBalance = data.playBalanceSeconds || 0;
+          let mode = data.mode || "NOTHING";
+
+          if (elapsedSeconds > 0) {
+            if (mode === "WORK") {
+              // Add offline work time
+              workElapsed += elapsedSeconds;
+              playBalance += Math.floor(elapsedSeconds * PLAY_GAIN_RATE);
+            } else if (mode === "PLAY") {
+              // Subtract offline play time
+              playBalance = Math.max(0, playBalance - elapsedSeconds);
+              if (playBalance === 0) {
+                mode = "NOTHING";
+              }
+            }
+          }
+
+          const newState: AppState = {
+            workElapsedSeconds: workElapsed,
+            playBalanceSeconds: playBalance,
+            mode: mode,
+            lastTickTimestamp: now,
+            quests: data.quests || [],
+            inventory: data.inventory || [],
+          };
+
+          setState(newState);
+          lastSavedState.current = JSON.stringify(newState);
+        } else {
+          // New user - create initial document
+          const newState = {
+            ...initialState,
+            lastTickTimestamp: Date.now(),
+          };
+          await setDoc(userDocRef, newState);
+          setState(newState);
+          lastSavedState.current = JSON.stringify(newState);
+        }
+      } catch (error) {
+        console.error("[Firestore] Load error:", error);
+      } finally {
+        isLoadingFromFirestore.current = false;
+        setIsHydrated(true);
+      }
+    };
+
+    loadFromFirestore();
   }, [user]);
 
   // ============================================
-  // FIRESTORE SYNC - Save user data
+  // SAVE STATE CHANGES TO FIRESTORE
   // ============================================
   useEffect(() => {
-    if (!user || !isHydrated || isInitialLoad.current) return;
+    if (!user || !isHydrated || isLoadingFromFirestore.current) return;
+    saveToFirestore(user.uid, state);
+  }, [user, state, isHydrated, saveToFirestore]);
 
-    const userDocRef = doc(db, "users", user.uid);
-    setDoc(userDocRef, state, { merge: true });
+  // ============================================
+  // SAVE ON PAGE VISIBILITY CHANGE (tab switch, minimize)
+  // ============================================
+  useEffect(() => {
+    if (!user || !isHydrated) return;
+
+    const handleVisibilityChange = async () => {
+      if (document.visibilityState === "hidden") {
+        // Immediately save when user leaves
+        try {
+          const userDocRef = doc(db, "users", user.uid);
+          await setDoc(userDocRef, state);
+          lastSavedState.current = JSON.stringify(state);
+          console.log("[Firestore] Saved on visibility hidden");
+        } catch (error) {
+          console.error("[Firestore] Save on hidden error:", error);
+        }
+      } else if (document.visibilityState === "visible") {
+        // Recalculate time when user returns
+        const now = Date.now();
+        const elapsedSeconds = Math.floor((now - state.lastTickTimestamp) / 1000);
+
+        if (elapsedSeconds > 1) {
+          setState((prev) => {
+            let workElapsed = prev.workElapsedSeconds;
+            let playBalance = prev.playBalanceSeconds;
+            let mode = prev.mode;
+
+            if (prev.mode === "WORK") {
+              workElapsed += elapsedSeconds;
+              playBalance += Math.floor(elapsedSeconds * PLAY_GAIN_RATE);
+            } else if (prev.mode === "PLAY") {
+              playBalance = Math.max(0, playBalance - elapsedSeconds);
+              if (playBalance === 0) {
+                mode = "NOTHING";
+                triggerPlayEndedNotification();
+              }
+            }
+
+            return {
+              ...prev,
+              workElapsedSeconds: workElapsed,
+              playBalanceSeconds: playBalance,
+              mode,
+              lastTickTimestamp: now,
+            };
+          });
+        }
+      }
+    };
+
+    const handleBeforeUnload = async () => {
+      // Save before page unload
+      if (user) {
+        try {
+          const userDocRef = doc(db, "users", user.uid);
+          await setDoc(userDocRef, state);
+        } catch {
+          // Ignore errors on unload
+        }
+      }
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    window.addEventListener("beforeunload", handleBeforeUnload);
+
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      window.removeEventListener("beforeunload", handleBeforeUnload);
+    };
   }, [user, state, isHydrated]);
 
   // ============================================
@@ -134,18 +278,15 @@ export function TimerProvider({ children }: { children: React.ReactNode }) {
   // NOTIFICATION HELPERS
   // ============================================
   const triggerPlayEndedNotification = useCallback(() => {
-    // Show in-app notification
     setShowPlayEndedNotification(true);
 
-    // Try Web Notification API
     if (typeof Notification !== "undefined" && Notification.permission === "granted") {
       new Notification("Life Timer", {
-        body: "Play time is over! Time to get back to work or rest.",
+        body: "Play süresi bitti! Çalışmaya geri dön.",
         icon: "/favicon.ico",
       });
     }
 
-    // Play a simple beep sound
     try {
       const audioContext = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
       const oscillator = audioContext.createOscillator();
@@ -159,7 +300,7 @@ export function TimerProvider({ children }: { children: React.ReactNode }) {
       oscillator.start(audioContext.currentTime);
       oscillator.stop(audioContext.currentTime + 0.5);
     } catch {
-      // Audio not available, ignore
+      // Audio not available
     }
   }, []);
 
@@ -169,70 +310,36 @@ export function TimerProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     if (!isHydrated || !user) return;
 
-    // Calculate elapsed time since last tick (handles refresh/background)
-    const now = Date.now();
-    const elapsedMs = now - state.lastTickTimestamp;
-    const elapsedSeconds = Math.floor(elapsedMs / 1000);
-
-    // If significant time has passed (more than 1 second), catch up
-    if (elapsedSeconds > 1 && !isInitialLoad.current) {
-      setState((prev) => {
-        let newWorkElapsed = prev.workElapsedSeconds;
-        let newPlayBalance = prev.playBalanceSeconds;
-        let newMode = prev.mode;
-
-        if (prev.mode === "WORK") {
-          newWorkElapsed += elapsedSeconds;
-          newPlayBalance += Math.floor(elapsedSeconds * PLAY_GAIN_RATE);
-        } else if (prev.mode === "PLAY") {
-          newPlayBalance = Math.max(0, newPlayBalance - elapsedSeconds);
-          if (newPlayBalance === 0) {
-            newMode = "NOTHING";
-            triggerPlayEndedNotification();
-          }
-        }
-
-        return {
-          ...prev,
-          workElapsedSeconds: newWorkElapsed,
-          playBalanceSeconds: newPlayBalance,
-          mode: newMode,
-          lastTickTimestamp: now,
-        };
-      });
-    }
-
-    // Set up interval for real-time updates (every second)
     const interval = setInterval(() => {
       setState((prev) => {
         const currentTime = Date.now();
-        let newWorkElapsed = prev.workElapsedSeconds;
-        let newPlayBalance = prev.playBalanceSeconds;
-        let newMode = prev.mode;
+        let workElapsed = prev.workElapsedSeconds;
+        let playBalance = prev.playBalanceSeconds;
+        let mode = prev.mode;
 
         if (prev.mode === "WORK") {
-          newWorkElapsed += 1;
-          newPlayBalance += PLAY_GAIN_RATE;
+          workElapsed += 1;
+          playBalance += PLAY_GAIN_RATE;
         } else if (prev.mode === "PLAY") {
-          newPlayBalance = Math.max(0, newPlayBalance - 1);
-          if (newPlayBalance === 0) {
-            newMode = "NOTHING";
+          playBalance = Math.max(0, playBalance - 1);
+          if (playBalance === 0) {
+            mode = "NOTHING";
             triggerPlayEndedNotification();
           }
         }
 
         return {
           ...prev,
-          workElapsedSeconds: newWorkElapsed,
-          playBalanceSeconds: newPlayBalance,
-          mode: newMode,
+          workElapsedSeconds: workElapsed,
+          playBalanceSeconds: playBalance,
+          mode,
           lastTickTimestamp: currentTime,
         };
       });
     }, 1000);
 
     return () => clearInterval(interval);
-  }, [isHydrated, user, state.lastTickTimestamp, state.mode, triggerPlayEndedNotification]);
+  }, [isHydrated, user, triggerPlayEndedNotification]);
 
   const dismissPlayEndedNotification = useCallback(() => {
     setShowPlayEndedNotification(false);
@@ -258,7 +365,7 @@ export function TimerProvider({ children }: { children: React.ReactNode }) {
   );
 
   // ============================================
-  // PENALTY (-5 minutes from work)
+  // PENALTY
   // ============================================
   const applyPenalty = useCallback(() => {
     setState((prev) => {
