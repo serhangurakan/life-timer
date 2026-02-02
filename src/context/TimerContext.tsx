@@ -1,7 +1,9 @@
 "use client";
 
 import React, { createContext, useContext, useEffect, useCallback, useRef, useState } from "react";
-import { useLocalStorage } from "@/hooks/useLocalStorage";
+import { doc, setDoc, onSnapshot } from "firebase/firestore";
+import { db } from "@/lib/firebase";
+import { useAuth } from "@/context/AuthContext";
 import {
   Mode,
   Quest,
@@ -58,11 +60,63 @@ const TimerContext = createContext<TimerContextType | null>(null);
 // PROVIDER COMPONENT
 // ============================================
 export function TimerProvider({ children }: { children: React.ReactNode }) {
-  const [state, setState, isHydrated] = useLocalStorage<AppState>("life-timer-state", initialState);
+  const { user } = useAuth();
+  const [state, setState] = useState<AppState>(initialState);
+  const [isHydrated, setIsHydrated] = useState(false);
   const [showPlayEndedNotification, setShowPlayEndedNotification] = useState(false);
 
   // Ref to track if we've requested notification permission
   const notificationPermissionRequested = useRef(false);
+  // Ref to prevent saving during initial load
+  const isInitialLoad = useRef(true);
+
+  // ============================================
+  // FIRESTORE SYNC - Load user data
+  // ============================================
+  useEffect(() => {
+    if (!user) {
+      setState(initialState);
+      setIsHydrated(false);
+      isInitialLoad.current = true;
+      return;
+    }
+
+    // Subscribe to user's data in Firestore
+    const userDocRef = doc(db, "users", user.uid);
+    const unsubscribe = onSnapshot(userDocRef, (docSnap) => {
+      if (docSnap.exists()) {
+        const data = docSnap.data() as AppState;
+        setState({
+          ...initialState,
+          ...data,
+          lastTickTimestamp: data.lastTickTimestamp || Date.now(),
+        });
+      } else {
+        // New user - create initial document
+        setDoc(userDocRef, {
+          ...initialState,
+          lastTickTimestamp: Date.now(),
+        });
+      }
+      setIsHydrated(true);
+      // Allow saving after initial load completes
+      setTimeout(() => {
+        isInitialLoad.current = false;
+      }, 500);
+    });
+
+    return () => unsubscribe();
+  }, [user]);
+
+  // ============================================
+  // FIRESTORE SYNC - Save user data
+  // ============================================
+  useEffect(() => {
+    if (!user || !isHydrated || isInitialLoad.current) return;
+
+    const userDocRef = doc(db, "users", user.uid);
+    setDoc(userDocRef, state, { merge: true });
+  }, [user, state, isHydrated]);
 
   // ============================================
   // REQUEST NOTIFICATION PERMISSION
@@ -75,85 +129,6 @@ export function TimerProvider({ children }: { children: React.ReactNode }) {
       }
     }
   }, []);
-
-  // ============================================
-  // MAIN TIMER LOGIC - Date.now based
-  // ============================================
-  useEffect(() => {
-    if (!isHydrated) return;
-
-    // Calculate elapsed time since last tick (handles refresh/background)
-    const now = Date.now();
-    const elapsedMs = now - state.lastTickTimestamp;
-    const elapsedSeconds = Math.floor(elapsedMs / 1000);
-
-    // If significant time has passed (more than 1 second), catch up
-    if (elapsedSeconds > 1) {
-      setState((prev) => {
-        let newWorkElapsed = prev.workElapsedSeconds;
-        let newPlayBalance = prev.playBalanceSeconds;
-        let newMode = prev.mode;
-
-        if (prev.mode === "WORK") {
-          // Work mode: add elapsed time to work, and half to play balance
-          newWorkElapsed += elapsedSeconds;
-          newPlayBalance += Math.floor(elapsedSeconds * PLAY_GAIN_RATE);
-        } else if (prev.mode === "PLAY") {
-          // Play mode: subtract elapsed time from play balance
-          newPlayBalance = Math.max(0, newPlayBalance - elapsedSeconds);
-          if (newPlayBalance === 0) {
-            newMode = "NOTHING";
-            // Trigger notification
-            triggerPlayEndedNotification();
-          }
-        }
-        // NOTHING mode: no changes
-
-        return {
-          ...prev,
-          workElapsedSeconds: newWorkElapsed,
-          playBalanceSeconds: newPlayBalance,
-          mode: newMode,
-          lastTickTimestamp: now,
-        };
-      });
-    }
-
-    // Set up interval for real-time updates (every second)
-    const interval = setInterval(() => {
-      setState((prev) => {
-        const currentTime = Date.now();
-        let newWorkElapsed = prev.workElapsedSeconds;
-        let newPlayBalance = prev.playBalanceSeconds;
-        let newMode = prev.mode;
-
-        if (prev.mode === "WORK") {
-          // WORK: increment work elapsed, add play balance at half rate
-          newWorkElapsed += 1;
-          newPlayBalance += PLAY_GAIN_RATE; // 0.5 seconds per second
-        } else if (prev.mode === "PLAY") {
-          // PLAY: decrement play balance
-          newPlayBalance = Math.max(0, newPlayBalance - 1);
-          if (newPlayBalance === 0) {
-            // Play time ended!
-            newMode = "NOTHING";
-            triggerPlayEndedNotification();
-          }
-        }
-        // NOTHING: no changes to timers
-
-        return {
-          ...prev,
-          workElapsedSeconds: newWorkElapsed,
-          playBalanceSeconds: newPlayBalance,
-          mode: newMode,
-          lastTickTimestamp: currentTime,
-        };
-      });
-    }, 1000);
-
-    return () => clearInterval(interval);
-  }, [isHydrated, setState, state.lastTickTimestamp, state.mode]);
 
   // ============================================
   // NOTIFICATION HELPERS
@@ -188,6 +163,77 @@ export function TimerProvider({ children }: { children: React.ReactNode }) {
     }
   }, []);
 
+  // ============================================
+  // MAIN TIMER LOGIC - Date.now based
+  // ============================================
+  useEffect(() => {
+    if (!isHydrated || !user) return;
+
+    // Calculate elapsed time since last tick (handles refresh/background)
+    const now = Date.now();
+    const elapsedMs = now - state.lastTickTimestamp;
+    const elapsedSeconds = Math.floor(elapsedMs / 1000);
+
+    // If significant time has passed (more than 1 second), catch up
+    if (elapsedSeconds > 1 && !isInitialLoad.current) {
+      setState((prev) => {
+        let newWorkElapsed = prev.workElapsedSeconds;
+        let newPlayBalance = prev.playBalanceSeconds;
+        let newMode = prev.mode;
+
+        if (prev.mode === "WORK") {
+          newWorkElapsed += elapsedSeconds;
+          newPlayBalance += Math.floor(elapsedSeconds * PLAY_GAIN_RATE);
+        } else if (prev.mode === "PLAY") {
+          newPlayBalance = Math.max(0, newPlayBalance - elapsedSeconds);
+          if (newPlayBalance === 0) {
+            newMode = "NOTHING";
+            triggerPlayEndedNotification();
+          }
+        }
+
+        return {
+          ...prev,
+          workElapsedSeconds: newWorkElapsed,
+          playBalanceSeconds: newPlayBalance,
+          mode: newMode,
+          lastTickTimestamp: now,
+        };
+      });
+    }
+
+    // Set up interval for real-time updates (every second)
+    const interval = setInterval(() => {
+      setState((prev) => {
+        const currentTime = Date.now();
+        let newWorkElapsed = prev.workElapsedSeconds;
+        let newPlayBalance = prev.playBalanceSeconds;
+        let newMode = prev.mode;
+
+        if (prev.mode === "WORK") {
+          newWorkElapsed += 1;
+          newPlayBalance += PLAY_GAIN_RATE;
+        } else if (prev.mode === "PLAY") {
+          newPlayBalance = Math.max(0, newPlayBalance - 1);
+          if (newPlayBalance === 0) {
+            newMode = "NOTHING";
+            triggerPlayEndedNotification();
+          }
+        }
+
+        return {
+          ...prev,
+          workElapsedSeconds: newWorkElapsed,
+          playBalanceSeconds: newPlayBalance,
+          mode: newMode,
+          lastTickTimestamp: currentTime,
+        };
+      });
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [isHydrated, user, state.lastTickTimestamp, state.mode, triggerPlayEndedNotification]);
+
   const dismissPlayEndedNotification = useCallback(() => {
     setShowPlayEndedNotification(false);
   }, []);
@@ -197,7 +243,6 @@ export function TimerProvider({ children }: { children: React.ReactNode }) {
   // ============================================
   const setMode = useCallback(
     (newMode: Mode) => {
-      // Don't allow switching to PLAY if balance is 0
       if (newMode === "PLAY" && state.playBalanceSeconds <= 0) {
         alert("Play bakiyeniz yok! Önce Work yapın veya Inventory'den süre kullanın.");
         return;
@@ -209,7 +254,7 @@ export function TimerProvider({ children }: { children: React.ReactNode }) {
         lastTickTimestamp: Date.now(),
       }));
     },
-    [setState, state.playBalanceSeconds]
+    [state.playBalanceSeconds]
   );
 
   // ============================================
@@ -217,13 +262,8 @@ export function TimerProvider({ children }: { children: React.ReactNode }) {
   // ============================================
   const applyPenalty = useCallback(() => {
     setState((prev) => {
-      // Reduce work by 5 minutes (300 seconds)
       const newWorkElapsed = Math.max(0, prev.workElapsedSeconds - PENALTY_SECONDS);
-
-      // IMPORTANT: Reduce play balance proportionally (half of work penalty)
-      // This maintains the 0.5 ratio between work and play earned
-      // If user earned play through work, removing work should remove proportional play
-      const playPenalty = Math.floor(PENALTY_SECONDS * PLAY_GAIN_RATE); // 150 seconds
+      const playPenalty = Math.floor(PENALTY_SECONDS * PLAY_GAIN_RATE);
       const newPlayBalance = Math.max(0, prev.playBalanceSeconds - playPenalty);
 
       return {
@@ -232,75 +272,60 @@ export function TimerProvider({ children }: { children: React.ReactNode }) {
         playBalanceSeconds: newPlayBalance,
       };
     });
-  }, [setState]);
+  }, []);
 
   // ============================================
   // QUEST ACTIONS
   // ============================================
-  const addQuest = useCallback(
-    (title: string, rewardMinutes: number) => {
-      const newQuest: Quest = {
-        id: crypto.randomUUID(),
-        title,
-        rewardMinutes,
-      };
-      setState((prev) => ({
-        ...prev,
-        quests: [...prev.quests, newQuest],
-      }));
-    },
-    [setState]
-  );
+  const addQuest = useCallback((title: string, rewardMinutes: number) => {
+    const newQuest: Quest = {
+      id: crypto.randomUUID(),
+      title,
+      rewardMinutes,
+    };
+    setState((prev) => ({
+      ...prev,
+      quests: [...prev.quests, newQuest],
+    }));
+  }, []);
 
-  const deleteQuest = useCallback(
-    (id: string) => {
-      setState((prev) => ({
-        ...prev,
-        quests: prev.quests.filter((q) => q.id !== id),
-      }));
-    },
-    [setState]
-  );
+  const deleteQuest = useCallback((id: string) => {
+    setState((prev) => ({
+      ...prev,
+      quests: prev.quests.filter((q) => q.id !== id),
+    }));
+  }, []);
 
-  const claimQuest = useCallback(
-    (quest: Quest) => {
-      // Add to inventory
-      const newItem: InventoryItem = {
-        id: crypto.randomUUID(),
-        questId: quest.id,
-        title: quest.title,
-        minutes: quest.rewardMinutes,
-        createdAt: Date.now(),
-      };
-      setState((prev) => ({
-        ...prev,
-        inventory: [...prev.inventory, newItem],
-      }));
-    },
-    [setState]
-  );
+  const claimQuest = useCallback((quest: Quest) => {
+    const newItem: InventoryItem = {
+      id: crypto.randomUUID(),
+      questId: quest.id,
+      title: quest.title,
+      minutes: quest.rewardMinutes,
+      createdAt: Date.now(),
+    };
+    setState((prev) => ({
+      ...prev,
+      inventory: [...prev.inventory, newItem],
+    }));
+  }, []);
 
   // ============================================
   // INVENTORY ACTIONS
   // ============================================
-  const useInventoryItems = useCallback(
-    (ids: string[]) => {
-      setState((prev) => {
-        // Calculate total minutes from selected items
-        const selectedItems = prev.inventory.filter((item) => ids.includes(item.id));
-        const totalMinutes = selectedItems.reduce((sum, item) => sum + item.minutes, 0);
-        const totalSeconds = totalMinutes * 60;
+  const useInventoryItems = useCallback((ids: string[]) => {
+    setState((prev) => {
+      const selectedItems = prev.inventory.filter((item) => ids.includes(item.id));
+      const totalMinutes = selectedItems.reduce((sum, item) => sum + item.minutes, 0);
+      const totalSeconds = totalMinutes * 60;
 
-        // Add to play balance and remove items from inventory
-        return {
-          ...prev,
-          playBalanceSeconds: prev.playBalanceSeconds + totalSeconds,
-          inventory: prev.inventory.filter((item) => !ids.includes(item.id)),
-        };
-      });
-    },
-    [setState]
-  );
+      return {
+        ...prev,
+        playBalanceSeconds: prev.playBalanceSeconds + totalSeconds,
+        inventory: prev.inventory.filter((item) => !ids.includes(item.id)),
+      };
+    });
+  }, []);
 
   // ============================================
   // CONTEXT VALUE

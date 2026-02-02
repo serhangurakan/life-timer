@@ -1,10 +1,12 @@
 "use client";
 
 import { useTimer } from "@/context/TimerContext";
+import { useAuth } from "@/context/AuthContext";
 import TimerDisplay from "@/components/TimerDisplay";
 import Toast from "@/components/Toast";
 
 export default function HomePage() {
+  const { user, signOut } = useAuth();
   const {
     workElapsedSeconds,
     playBalanceSeconds,
@@ -16,7 +18,7 @@ export default function HomePage() {
     dismissPlayEndedNotification,
   } = useTimer();
 
-  // Show loading state until hydrated from localStorage
+  // Show loading state until hydrated from Firestore
   if (!isHydrated) {
     return (
       <div className="flex items-center justify-center min-h-screen">
@@ -34,8 +36,29 @@ export default function HomePage() {
         onDismiss={dismissPlayEndedNotification}
       />
 
-      {/* Header */}
-      <h1 className="text-2xl font-bold text-center mb-8">Life Timer</h1>
+      {/* Header with user info */}
+      <div className="flex items-center justify-between mb-6">
+        <div>
+          <h1 className="text-2xl font-bold">Life Timer</h1>
+          <p className="text-sm text-gray-500">
+            Merhaba, {user?.displayName || user?.email?.split("@")[0]}
+          </p>
+        </div>
+        <button
+          onClick={signOut}
+          className="p-2 text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded-lg transition-colors"
+          title="Çıkış yap"
+        >
+          <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              strokeWidth={2}
+              d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"
+            />
+          </svg>
+        </button>
+      </div>
 
       {/* Work Panel */}
       <button

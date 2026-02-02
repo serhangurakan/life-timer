@@ -1,8 +1,9 @@
 import type { Metadata, Viewport } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
+import { AuthProvider } from "@/context/AuthContext";
 import { TimerProvider } from "@/context/TimerContext";
-import BottomNav from "@/components/BottomNav";
+import AppShell from "@/components/AppShell";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -38,10 +39,11 @@ export default function RootLayout({
       <body
         className={`${geistSans.variable} ${geistMono.variable} antialiased bg-gray-50 min-h-screen`}
       >
-        <TimerProvider>
-          <main className="pb-20 min-h-screen">{children}</main>
-          <BottomNav />
-        </TimerProvider>
+        <AuthProvider>
+          <TimerProvider>
+            <AppShell>{children}</AppShell>
+          </TimerProvider>
+        </AuthProvider>
       </body>
     </html>
   );
