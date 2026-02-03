@@ -48,30 +48,6 @@ interface TimerContextType {
 const TimerContext = createContext<TimerContextType | null>(null);
 
 // ============================================
-// DEBOUNCE HELPER
-// ============================================
-function useDebouncedCallback<T extends (...args: Parameters<T>) => void>(
-  callback: T,
-  delay: number
-): T {
-  const timeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const callbackRef = useRef(callback);
-  callbackRef.current = callback;
-
-  return useCallback(
-    ((...args: Parameters<T>) => {
-      if (timeoutRef.current) {
-        clearTimeout(timeoutRef.current);
-      }
-      timeoutRef.current = setTimeout(() => {
-        callbackRef.current(...args);
-      }, delay);
-    }) as T,
-    [delay]
-  );
-}
-
-// ============================================
 // PROVIDER COMPONENT
 // ============================================
 export function TimerProvider({ children }: { children: React.ReactNode }) {
@@ -82,30 +58,51 @@ export function TimerProvider({ children }: { children: React.ReactNode }) {
 
   const notificationPermissionRequested = useRef(false);
   const isLoadingFromFirestore = useRef(false);
-  const lastSavedState = useRef<string>("");
+  const lastSaveTime = useRef<number>(0);
+  const saveIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const stateRef = useRef<AppState>(state);
+
+  // Keep stateRef in sync with state
+  useEffect(() => {
+    stateRef.current = state;
+  }, [state]);
 
   // ============================================
-  // FIRESTORE SAVE (debounced - 2 seconds)
+  // DIRECT SAVE FUNCTION (no debounce)
   // ============================================
-  const saveToFirestore = useDebouncedCallback(
-    async (userId: string, data: AppState) => {
-      if (isLoadingFromFirestore.current) return;
+  const saveNow = useCallback(async (userId: string, data: AppState) => {
+    if (isLoadingFromFirestore.current) return;
 
-      const stateString = JSON.stringify(data);
-      // Don't save if nothing changed
-      if (stateString === lastSavedState.current) return;
+    try {
+      const userDocRef = doc(db, "users", userId);
+      await setDoc(userDocRef, data);
+      lastSaveTime.current = Date.now();
+      console.log("[Firestore] Saved:", data.workElapsedSeconds, "work,", data.playBalanceSeconds, "play");
+    } catch (error) {
+      console.error("[Firestore] Save error:", error);
+    }
+  }, []);
 
-      try {
-        const userDocRef = doc(db, "users", userId);
-        await setDoc(userDocRef, data);
-        lastSavedState.current = stateString;
-        console.log("[Firestore] Saved at", new Date().toLocaleTimeString());
-      } catch (error) {
-        console.error("[Firestore] Save error:", error);
+  // ============================================
+  // PERIODIC SAVE - Every 5 seconds while active
+  // ============================================
+  useEffect(() => {
+    if (!user || !isHydrated) return;
+
+    // Save every 5 seconds if mode is WORK or PLAY
+    saveIntervalRef.current = setInterval(() => {
+      const currentState = stateRef.current;
+      if (currentState.mode === "WORK" || currentState.mode === "PLAY") {
+        saveNow(user.uid, currentState);
       }
-    },
-    2000 // Save every 2 seconds max
-  );
+    }, 5000);
+
+    return () => {
+      if (saveIntervalRef.current) {
+        clearInterval(saveIntervalRef.current);
+      }
+    };
+  }, [user, isHydrated, saveNow]);
 
   // ============================================
   // FIRESTORE LOAD - Only on mount/user change
@@ -114,12 +111,12 @@ export function TimerProvider({ children }: { children: React.ReactNode }) {
     if (!user) {
       setState(initialState);
       setIsHydrated(false);
-      lastSavedState.current = "";
       return;
     }
 
     const loadFromFirestore = async () => {
       isLoadingFromFirestore.current = true;
+      console.log("[Firestore] Loading data for user:", user.uid);
 
       try {
         const userDocRef = doc(db, "users", user.uid);
@@ -127,6 +124,8 @@ export function TimerProvider({ children }: { children: React.ReactNode }) {
 
         if (docSnap.exists()) {
           const data = docSnap.data() as AppState;
+          console.log("[Firestore] Loaded:", data);
+
           const now = Date.now();
           const lastTimestamp = data.lastTickTimestamp || now;
           const elapsedSeconds = Math.floor((now - lastTimestamp) / 1000);
@@ -138,11 +137,10 @@ export function TimerProvider({ children }: { children: React.ReactNode }) {
 
           if (elapsedSeconds > 0) {
             if (mode === "WORK") {
-              // Add offline work time
               workElapsed += elapsedSeconds;
               playBalance += Math.floor(elapsedSeconds * PLAY_GAIN_RATE);
+              console.log("[Firestore] Added offline work time:", elapsedSeconds, "seconds");
             } else if (mode === "PLAY") {
-              // Subtract offline play time
               playBalance = Math.max(0, playBalance - elapsedSeconds);
               if (playBalance === 0) {
                 mode = "NOTHING";
@@ -160,16 +158,16 @@ export function TimerProvider({ children }: { children: React.ReactNode }) {
           };
 
           setState(newState);
-          lastSavedState.current = JSON.stringify(newState);
+          stateRef.current = newState;
         } else {
-          // New user - create initial document
+          console.log("[Firestore] No data found, creating new document");
           const newState = {
             ...initialState,
             lastTickTimestamp: Date.now(),
           };
           await setDoc(userDocRef, newState);
           setState(newState);
-          lastSavedState.current = JSON.stringify(newState);
+          stateRef.current = newState;
         }
       } catch (error) {
         console.error("[Firestore] Load error:", error);
@@ -183,15 +181,21 @@ export function TimerProvider({ children }: { children: React.ReactNode }) {
   }, [user]);
 
   // ============================================
-  // SAVE STATE CHANGES TO FIRESTORE
+  // SAVE ON MODE CHANGE (immediate)
   // ============================================
+  const previousMode = useRef<Mode>("NOTHING");
   useEffect(() => {
     if (!user || !isHydrated || isLoadingFromFirestore.current) return;
-    saveToFirestore(user.uid, state);
-  }, [user, state, isHydrated, saveToFirestore]);
+
+    // Save immediately when mode changes
+    if (state.mode !== previousMode.current) {
+      previousMode.current = state.mode;
+      saveNow(user.uid, state);
+    }
+  }, [user, state.mode, state, isHydrated, saveNow]);
 
   // ============================================
-  // SAVE ON PAGE VISIBILITY CHANGE (tab switch, minimize)
+  // SAVE ON PAGE VISIBILITY CHANGE
   // ============================================
   useEffect(() => {
     if (!user || !isHydrated) return;
@@ -199,68 +203,85 @@ export function TimerProvider({ children }: { children: React.ReactNode }) {
     const handleVisibilityChange = async () => {
       if (document.visibilityState === "hidden") {
         // Immediately save when user leaves
+        console.log("[Firestore] Saving on visibility hidden");
+        await saveNow(user.uid, stateRef.current);
+      } else if (document.visibilityState === "visible") {
+        // Reload from Firestore when user returns to get latest data
+        console.log("[Firestore] Reloading on visibility visible");
+        isLoadingFromFirestore.current = true;
+
         try {
           const userDocRef = doc(db, "users", user.uid);
-          await setDoc(userDocRef, state);
-          lastSavedState.current = JSON.stringify(state);
-          console.log("[Firestore] Saved on visibility hidden");
-        } catch (error) {
-          console.error("[Firestore] Save on hidden error:", error);
-        }
-      } else if (document.visibilityState === "visible") {
-        // Recalculate time when user returns
-        const now = Date.now();
-        const elapsedSeconds = Math.floor((now - state.lastTickTimestamp) / 1000);
+          const docSnap = await getDoc(userDocRef);
 
-        if (elapsedSeconds > 1) {
-          setState((prev) => {
-            let workElapsed = prev.workElapsedSeconds;
-            let playBalance = prev.playBalanceSeconds;
-            let mode = prev.mode;
+          if (docSnap.exists()) {
+            const data = docSnap.data() as AppState;
+            const now = Date.now();
+            const lastTimestamp = data.lastTickTimestamp || now;
+            const elapsedSeconds = Math.floor((now - lastTimestamp) / 1000);
 
-            if (prev.mode === "WORK") {
-              workElapsed += elapsedSeconds;
-              playBalance += Math.floor(elapsedSeconds * PLAY_GAIN_RATE);
-            } else if (prev.mode === "PLAY") {
-              playBalance = Math.max(0, playBalance - elapsedSeconds);
-              if (playBalance === 0) {
-                mode = "NOTHING";
-                triggerPlayEndedNotification();
+            let workElapsed = data.workElapsedSeconds || 0;
+            let playBalance = data.playBalanceSeconds || 0;
+            let mode = data.mode || "NOTHING";
+
+            if (elapsedSeconds > 0) {
+              if (mode === "WORK") {
+                workElapsed += elapsedSeconds;
+                playBalance += Math.floor(elapsedSeconds * PLAY_GAIN_RATE);
+              } else if (mode === "PLAY") {
+                playBalance = Math.max(0, playBalance - elapsedSeconds);
+                if (playBalance === 0) {
+                  mode = "NOTHING";
+                  triggerPlayEndedNotification();
+                }
               }
             }
 
-            return {
-              ...prev,
+            const newState: AppState = {
               workElapsedSeconds: workElapsed,
               playBalanceSeconds: playBalance,
-              mode,
+              mode: mode,
               lastTickTimestamp: now,
+              quests: data.quests || [],
+              inventory: data.inventory || [],
             };
-          });
+
+            setState(newState);
+            stateRef.current = newState;
+          }
+        } catch (error) {
+          console.error("[Firestore] Reload error:", error);
+        } finally {
+          isLoadingFromFirestore.current = false;
         }
       }
     };
 
-    const handleBeforeUnload = async () => {
-      // Save before page unload
-      if (user) {
-        try {
-          const userDocRef = doc(db, "users", user.uid);
-          await setDoc(userDocRef, state);
-        } catch {
-          // Ignore errors on unload
-        }
-      }
+    const handleBeforeUnload = () => {
+      // Sync save before page unload using navigator.sendBeacon workaround
+      const data = JSON.stringify(stateRef.current);
+      localStorage.setItem("life-timer-pending-save", data);
+      localStorage.setItem("life-timer-pending-uid", user.uid);
     };
 
     document.addEventListener("visibilitychange", handleVisibilityChange);
     window.addEventListener("beforeunload", handleBeforeUnload);
 
+    // Check for pending save from previous session
+    const pendingSave = localStorage.getItem("life-timer-pending-save");
+    const pendingUid = localStorage.getItem("life-timer-pending-uid");
+    if (pendingSave && pendingUid === user.uid) {
+      const pendingData = JSON.parse(pendingSave) as AppState;
+      saveNow(user.uid, pendingData);
+      localStorage.removeItem("life-timer-pending-save");
+      localStorage.removeItem("life-timer-pending-uid");
+    }
+
     return () => {
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       window.removeEventListener("beforeunload", handleBeforeUnload);
     };
-  }, [user, state, isHydrated]);
+  }, [user, isHydrated, saveNow]);
 
   // ============================================
   // REQUEST NOTIFICATION PERMISSION
