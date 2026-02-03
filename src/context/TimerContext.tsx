@@ -58,17 +58,86 @@ export function TimerProvider({ children }: { children: React.ReactNode }) {
 
   const notificationPermissionRequested = useRef(false);
   const isLoadingFromFirestore = useRef(false);
-  const lastSaveTime = useRef<number>(0);
   const saveIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const stateRef = useRef<AppState>(state);
 
-  // Keep stateRef in sync with state
-  useEffect(() => {
-    stateRef.current = state;
-  }, [state]);
+  // Keep stateRef ALWAYS in sync with state
+  stateRef.current = state;
 
   // ============================================
-  // DIRECT SAVE FUNCTION (no debounce)
+  // NOTIFICATION HELPERS (defined early to use in other effects)
+  // ============================================
+  const triggerPlayEndedNotification = useCallback(() => {
+    setShowPlayEndedNotification(true);
+
+    if (typeof Notification !== "undefined" && Notification.permission === "granted") {
+      new Notification("Life Timer", {
+        body: "Play süresi bitti! Çalışmaya geri dön.",
+        icon: "/favicon.ico",
+      });
+    }
+
+    try {
+      const audioContext = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
+      const oscillator = audioContext.createOscillator();
+      const gainNode = audioContext.createGain();
+      oscillator.connect(gainNode);
+      gainNode.connect(audioContext.destination);
+      oscillator.frequency.value = 800;
+      oscillator.type = "sine";
+      gainNode.gain.setValueAtTime(0.3, audioContext.currentTime);
+      gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.5);
+      oscillator.start(audioContext.currentTime);
+      oscillator.stop(audioContext.currentTime + 0.5);
+    } catch {
+      // Audio not available
+    }
+  }, []);
+
+  // ============================================
+  // CALCULATE ELAPSED TIME - Core function
+  // ============================================
+  const calculateElapsedTime = useCallback(() => {
+    const now = Date.now();
+    const current = stateRef.current;
+    const elapsedMs = now - current.lastTickTimestamp;
+    const elapsedSeconds = Math.floor(elapsedMs / 1000);
+
+    if (elapsedSeconds <= 0) return;
+
+    console.log("[Timer] Calculating elapsed time:", elapsedSeconds, "seconds, mode:", current.mode);
+
+    setState((prev) => {
+      let workElapsed = prev.workElapsedSeconds;
+      let playBalance = prev.playBalanceSeconds;
+      let mode = prev.mode;
+
+      if (prev.mode === "WORK") {
+        workElapsed += elapsedSeconds;
+        playBalance += elapsedSeconds * PLAY_GAIN_RATE;
+        console.log("[Timer] Added work time:", elapsedSeconds, "s. New work:", workElapsed);
+      } else if (prev.mode === "PLAY") {
+        const newBalance = playBalance - elapsedSeconds;
+        playBalance = Math.max(0, newBalance);
+        console.log("[Timer] Subtracted play time:", elapsedSeconds, "s. New play:", playBalance);
+        if (playBalance === 0) {
+          mode = "NOTHING";
+          triggerPlayEndedNotification();
+        }
+      }
+
+      return {
+        ...prev,
+        workElapsedSeconds: workElapsed,
+        playBalanceSeconds: playBalance,
+        mode,
+        lastTickTimestamp: now,
+      };
+    });
+  }, [triggerPlayEndedNotification]);
+
+  // ============================================
+  // DIRECT SAVE FUNCTION
   // ============================================
   const saveNow = useCallback(async (userId: string, data: AppState) => {
     if (isLoadingFromFirestore.current) return;
@@ -76,8 +145,7 @@ export function TimerProvider({ children }: { children: React.ReactNode }) {
     try {
       const userDocRef = doc(db, "users", userId);
       await setDoc(userDocRef, data);
-      lastSaveTime.current = Date.now();
-      console.log("[Firestore] Saved:", data.workElapsedSeconds, "work,", data.playBalanceSeconds, "play");
+      console.log("[Firestore] Saved:", Math.floor(data.workElapsedSeconds), "work,", Math.floor(data.playBalanceSeconds), "play");
     } catch (error) {
       console.error("[Firestore] Save error:", error);
     }
@@ -89,7 +157,6 @@ export function TimerProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     if (!user || !isHydrated) return;
 
-    // Save every 5 seconds if mode is WORK or PLAY
     saveIntervalRef.current = setInterval(() => {
       const currentState = stateRef.current;
       if (currentState.mode === "WORK" || currentState.mode === "PLAY") {
@@ -124,24 +191,26 @@ export function TimerProvider({ children }: { children: React.ReactNode }) {
 
         if (docSnap.exists()) {
           const data = docSnap.data() as AppState;
-          console.log("[Firestore] Loaded:", data);
+          console.log("[Firestore] Raw loaded data:", data);
 
           const now = Date.now();
           const lastTimestamp = data.lastTickTimestamp || now;
           const elapsedSeconds = Math.floor((now - lastTimestamp) / 1000);
 
-          // Calculate time that passed while offline
           let workElapsed = data.workElapsedSeconds || 0;
           let playBalance = data.playBalanceSeconds || 0;
           let mode = data.mode || "NOTHING";
 
+          console.log("[Firestore] Time since last save:", elapsedSeconds, "seconds");
+
           if (elapsedSeconds > 0) {
             if (mode === "WORK") {
               workElapsed += elapsedSeconds;
-              playBalance += Math.floor(elapsedSeconds * PLAY_GAIN_RATE);
+              playBalance += elapsedSeconds * PLAY_GAIN_RATE;
               console.log("[Firestore] Added offline work time:", elapsedSeconds, "seconds");
             } else if (mode === "PLAY") {
               playBalance = Math.max(0, playBalance - elapsedSeconds);
+              console.log("[Firestore] Subtracted offline play time:", elapsedSeconds, "seconds");
               if (playBalance === 0) {
                 mode = "NOTHING";
               }
@@ -157,6 +226,7 @@ export function TimerProvider({ children }: { children: React.ReactNode }) {
             inventory: data.inventory || [],
           };
 
+          console.log("[Firestore] Final state after offline calc:", newState);
           setState(newState);
           stateRef.current = newState;
         } else {
@@ -187,66 +257,46 @@ export function TimerProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     if (!user || !isHydrated || isLoadingFromFirestore.current) return;
 
-    // Save immediately when mode changes
     if (state.mode !== previousMode.current) {
+      console.log("[Firestore] Mode changed from", previousMode.current, "to", state.mode);
       previousMode.current = state.mode;
       saveNow(user.uid, state);
     }
   }, [user, state.mode, state, isHydrated, saveNow]);
 
   // ============================================
-  // SAVE ON PAGE VISIBILITY CHANGE
+  // VISIBILITY CHANGE HANDLER
   // ============================================
   useEffect(() => {
     if (!user || !isHydrated) return;
 
-    const handleVisibilityChange = async () => {
+    const handleVisibilityChange = () => {
       if (document.visibilityState === "hidden") {
-        // Immediately save when user leaves
-        console.log("[Firestore] Saving on visibility hidden");
-        await saveNow(user.uid, stateRef.current);
-      } else if (document.visibilityState === "visible") {
-        // Calculate elapsed time locally when user returns
-        console.log("[Firestore] Calculating elapsed time on visibility visible");
-        const now = Date.now();
+        console.log("[Visibility] Hidden - saving current state");
+        // Update timestamp and save
         const currentState = stateRef.current;
-        const elapsedSeconds = Math.floor((now - currentState.lastTickTimestamp) / 1000);
-
-        if (elapsedSeconds > 1) {
-          setState((prev) => {
-            let workElapsed = prev.workElapsedSeconds;
-            let playBalance = prev.playBalanceSeconds;
-            let mode = prev.mode;
-
-            if (prev.mode === "WORK") {
-              workElapsed += elapsedSeconds;
-              playBalance += Math.floor(elapsedSeconds * PLAY_GAIN_RATE);
-              console.log("[Firestore] Added", elapsedSeconds, "seconds of work time");
-            } else if (prev.mode === "PLAY") {
-              playBalance = Math.max(0, playBalance - elapsedSeconds);
-              if (playBalance === 0) {
-                mode = "NOTHING";
-                triggerPlayEndedNotification();
-              }
-            }
-
-            return {
-              ...prev,
-              workElapsedSeconds: workElapsed,
-              playBalanceSeconds: playBalance,
-              mode,
-              lastTickTimestamp: now,
-            };
-          });
-        }
+        const stateToSave = {
+          ...currentState,
+          lastTickTimestamp: Date.now(),
+        };
+        saveNow(user.uid, stateToSave);
+      } else if (document.visibilityState === "visible") {
+        console.log("[Visibility] Visible - calculating elapsed time");
+        // Calculate and apply elapsed time
+        calculateElapsedTime();
       }
     };
 
     const handleBeforeUnload = () => {
-      // Sync save before page unload using navigator.sendBeacon workaround
-      const data = JSON.stringify(stateRef.current);
-      localStorage.setItem("life-timer-pending-save", data);
+      // Save to localStorage as backup
+      const currentState = stateRef.current;
+      const stateToSave = {
+        ...currentState,
+        lastTickTimestamp: Date.now(),
+      };
+      localStorage.setItem("life-timer-pending-save", JSON.stringify(stateToSave));
       localStorage.setItem("life-timer-pending-uid", user.uid);
+      console.log("[BeforeUnload] Saved to localStorage");
     };
 
     document.addEventListener("visibilitychange", handleVisibilityChange);
@@ -256,8 +306,44 @@ export function TimerProvider({ children }: { children: React.ReactNode }) {
     const pendingSave = localStorage.getItem("life-timer-pending-save");
     const pendingUid = localStorage.getItem("life-timer-pending-uid");
     if (pendingSave && pendingUid === user.uid) {
+      console.log("[Init] Found pending save, restoring...");
       const pendingData = JSON.parse(pendingSave) as AppState;
-      saveNow(user.uid, pendingData);
+
+      // Calculate elapsed time from pending save
+      const now = Date.now();
+      const elapsedSeconds = Math.floor((now - pendingData.lastTickTimestamp) / 1000);
+
+      let workElapsed = pendingData.workElapsedSeconds;
+      let playBalance = pendingData.playBalanceSeconds;
+      let mode = pendingData.mode;
+
+      if (elapsedSeconds > 0) {
+        if (mode === "WORK") {
+          workElapsed += elapsedSeconds;
+          playBalance += elapsedSeconds * PLAY_GAIN_RATE;
+        } else if (mode === "PLAY") {
+          playBalance = Math.max(0, playBalance - elapsedSeconds);
+          if (playBalance === 0) {
+            mode = "NOTHING";
+          }
+        }
+      }
+
+      const restoredState: AppState = {
+        ...pendingData,
+        workElapsedSeconds: workElapsed,
+        playBalanceSeconds: playBalance,
+        mode,
+        lastTickTimestamp: now,
+      };
+
+      // Only use pending save if it's newer than Firestore data
+      if (pendingData.lastTickTimestamp > stateRef.current.lastTickTimestamp) {
+        setState(restoredState);
+        stateRef.current = restoredState;
+        saveNow(user.uid, restoredState);
+      }
+
       localStorage.removeItem("life-timer-pending-save");
       localStorage.removeItem("life-timer-pending-uid");
     }
@@ -266,7 +352,7 @@ export function TimerProvider({ children }: { children: React.ReactNode }) {
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       window.removeEventListener("beforeunload", handleBeforeUnload);
     };
-  }, [user, isHydrated, saveNow]);
+  }, [user, isHydrated, saveNow, calculateElapsedTime]);
 
   // ============================================
   // REQUEST NOTIFICATION PERMISSION
@@ -281,42 +367,15 @@ export function TimerProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   // ============================================
-  // NOTIFICATION HELPERS
-  // ============================================
-  const triggerPlayEndedNotification = useCallback(() => {
-    setShowPlayEndedNotification(true);
-
-    if (typeof Notification !== "undefined" && Notification.permission === "granted") {
-      new Notification("Life Timer", {
-        body: "Play süresi bitti! Çalışmaya geri dön.",
-        icon: "/favicon.ico",
-      });
-    }
-
-    try {
-      const audioContext = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
-      const oscillator = audioContext.createOscillator();
-      const gainNode = audioContext.createGain();
-      oscillator.connect(gainNode);
-      gainNode.connect(audioContext.destination);
-      oscillator.frequency.value = 800;
-      oscillator.type = "sine";
-      gainNode.gain.setValueAtTime(0.3, audioContext.currentTime);
-      gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.5);
-      oscillator.start(audioContext.currentTime);
-      oscillator.stop(audioContext.currentTime + 0.5);
-    } catch {
-      // Audio not available
-    }
-  }, []);
-
-  // ============================================
-  // MAIN TIMER LOGIC - Date.now based
+  // MAIN TIMER LOGIC - runs every second when tab is active
   // ============================================
   useEffect(() => {
     if (!isHydrated || !user) return;
 
     const interval = setInterval(() => {
+      // Only tick if document is visible
+      if (document.visibilityState !== "visible") return;
+
       setState((prev) => {
         const currentTime = Date.now();
         let workElapsed = prev.workElapsedSeconds;
@@ -356,7 +415,7 @@ export function TimerProvider({ children }: { children: React.ReactNode }) {
   // ============================================
   const setMode = useCallback(
     (newMode: Mode) => {
-      if (newMode === "PLAY" && state.playBalanceSeconds <= 0) {
+      if (newMode === "PLAY" && stateRef.current.playBalanceSeconds <= 0) {
         alert("Play bakiyeniz yok! Önce Work yapın veya Inventory'den süre kullanın.");
         return;
       }
@@ -367,7 +426,7 @@ export function TimerProvider({ children }: { children: React.ReactNode }) {
         lastTickTimestamp: Date.now(),
       }));
     },
-    [state.playBalanceSeconds]
+    []
   );
 
   // ============================================
