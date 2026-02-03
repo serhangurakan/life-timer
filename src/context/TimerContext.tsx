@@ -206,53 +206,38 @@ export function TimerProvider({ children }: { children: React.ReactNode }) {
         console.log("[Firestore] Saving on visibility hidden");
         await saveNow(user.uid, stateRef.current);
       } else if (document.visibilityState === "visible") {
-        // Reload from Firestore when user returns to get latest data
-        console.log("[Firestore] Reloading on visibility visible");
-        isLoadingFromFirestore.current = true;
+        // Calculate elapsed time locally when user returns
+        console.log("[Firestore] Calculating elapsed time on visibility visible");
+        const now = Date.now();
+        const currentState = stateRef.current;
+        const elapsedSeconds = Math.floor((now - currentState.lastTickTimestamp) / 1000);
 
-        try {
-          const userDocRef = doc(db, "users", user.uid);
-          const docSnap = await getDoc(userDocRef);
+        if (elapsedSeconds > 1) {
+          setState((prev) => {
+            let workElapsed = prev.workElapsedSeconds;
+            let playBalance = prev.playBalanceSeconds;
+            let mode = prev.mode;
 
-          if (docSnap.exists()) {
-            const data = docSnap.data() as AppState;
-            const now = Date.now();
-            const lastTimestamp = data.lastTickTimestamp || now;
-            const elapsedSeconds = Math.floor((now - lastTimestamp) / 1000);
-
-            let workElapsed = data.workElapsedSeconds || 0;
-            let playBalance = data.playBalanceSeconds || 0;
-            let mode = data.mode || "NOTHING";
-
-            if (elapsedSeconds > 0) {
-              if (mode === "WORK") {
-                workElapsed += elapsedSeconds;
-                playBalance += Math.floor(elapsedSeconds * PLAY_GAIN_RATE);
-              } else if (mode === "PLAY") {
-                playBalance = Math.max(0, playBalance - elapsedSeconds);
-                if (playBalance === 0) {
-                  mode = "NOTHING";
-                  triggerPlayEndedNotification();
-                }
+            if (prev.mode === "WORK") {
+              workElapsed += elapsedSeconds;
+              playBalance += Math.floor(elapsedSeconds * PLAY_GAIN_RATE);
+              console.log("[Firestore] Added", elapsedSeconds, "seconds of work time");
+            } else if (prev.mode === "PLAY") {
+              playBalance = Math.max(0, playBalance - elapsedSeconds);
+              if (playBalance === 0) {
+                mode = "NOTHING";
+                triggerPlayEndedNotification();
               }
             }
 
-            const newState: AppState = {
+            return {
+              ...prev,
               workElapsedSeconds: workElapsed,
               playBalanceSeconds: playBalance,
-              mode: mode,
+              mode,
               lastTickTimestamp: now,
-              quests: data.quests || [],
-              inventory: data.inventory || [],
             };
-
-            setState(newState);
-            stateRef.current = newState;
-          }
-        } catch (error) {
-          console.error("[Firestore] Reload error:", error);
-        } finally {
-          isLoadingFromFirestore.current = false;
+          });
         }
       }
     };
