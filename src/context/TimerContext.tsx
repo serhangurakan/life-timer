@@ -438,13 +438,21 @@ export function TimerProvider({ children }: { children: React.ReactNode }) {
       const playPenalty = Math.floor(PENALTY_SECONDS * PLAY_GAIN_RATE);
       const newPlayBalance = Math.max(0, prev.playBalanceSeconds - playPenalty);
 
-      return {
+      const newState = {
         ...prev,
         workElapsedSeconds: newWorkElapsed,
         playBalanceSeconds: newPlayBalance,
+        lastTickTimestamp: Date.now(),
       };
+
+      // Save immediately after penalty
+      if (user) {
+        saveNow(user.uid, newState);
+      }
+
+      return newState;
     });
-  }, []);
+  }, [user, saveNow]);
 
   // ============================================
   // QUEST ACTIONS
@@ -455,18 +463,32 @@ export function TimerProvider({ children }: { children: React.ReactNode }) {
       title,
       rewardMinutes,
     };
-    setState((prev) => ({
-      ...prev,
-      quests: [...prev.quests, newQuest],
-    }));
-  }, []);
+    setState((prev) => {
+      const newState = {
+        ...prev,
+        quests: [...prev.quests, newQuest],
+        lastTickTimestamp: Date.now(),
+      };
+      if (user) {
+        saveNow(user.uid, newState);
+      }
+      return newState;
+    });
+  }, [user, saveNow]);
 
   const deleteQuest = useCallback((id: string) => {
-    setState((prev) => ({
-      ...prev,
-      quests: prev.quests.filter((q) => q.id !== id),
-    }));
-  }, []);
+    setState((prev) => {
+      const newState = {
+        ...prev,
+        quests: prev.quests.filter((q) => q.id !== id),
+        lastTickTimestamp: Date.now(),
+      };
+      if (user) {
+        saveNow(user.uid, newState);
+      }
+      return newState;
+    });
+  }, [user, saveNow]);
 
   const claimQuest = useCallback((quest: Quest) => {
     const newItem: InventoryItem = {
@@ -476,11 +498,18 @@ export function TimerProvider({ children }: { children: React.ReactNode }) {
       minutes: quest.rewardMinutes,
       createdAt: Date.now(),
     };
-    setState((prev) => ({
-      ...prev,
-      inventory: [...prev.inventory, newItem],
-    }));
-  }, []);
+    setState((prev) => {
+      const newState = {
+        ...prev,
+        inventory: [...prev.inventory, newItem],
+        lastTickTimestamp: Date.now(),
+      };
+      if (user) {
+        saveNow(user.uid, newState);
+      }
+      return newState;
+    });
+  }, [user, saveNow]);
 
   // ============================================
   // INVENTORY ACTIONS
@@ -491,13 +520,20 @@ export function TimerProvider({ children }: { children: React.ReactNode }) {
       const totalMinutes = selectedItems.reduce((sum, item) => sum + item.minutes, 0);
       const totalSeconds = totalMinutes * 60;
 
-      return {
+      const newState = {
         ...prev,
         playBalanceSeconds: prev.playBalanceSeconds + totalSeconds,
         inventory: prev.inventory.filter((item) => !ids.includes(item.id)),
+        lastTickTimestamp: Date.now(),
       };
+
+      if (user) {
+        saveNow(user.uid, newState);
+      }
+
+      return newState;
     });
-  }, []);
+  }, [user, saveNow]);
 
   // ============================================
   // CONTEXT VALUE
